@@ -1,0 +1,21 @@
+[package]
+name = "tuiterminals"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+dirs = "6"
+portable-pty = "0.9.0"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+sysinfo = "0.33"
+toml = "1.1.5"
+
+[profile.release]
+opt-level = 2
+debug = false
+lto = "thin"
+codegen-units = 1
