@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::text::Line;
 
 use crate::app::{App, relayable};
-use crate::config::Agent;
+use crate::config::{Agent, Tool, ToolKind};
 
 /// The modal state machine. `None` = no modal is open.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +31,15 @@ pub enum Modal {
     /// "send the active pane's screen to which other shared pane?" — `source`
     /// is the active pane's index.
     SendTarget { source: usize },
+    /// Tool picker. In [`ToolStep::Pick`] the user chooses a tool by digit; a
+    /// `prompt` tool fires immediately (typing into the active pane, so no
+    /// share question), while a `run` tool moves to [`ToolStep::Share`] where
+    /// the chosen index sits in `chosen` and the y/n share question is pending
+    /// (the tool spawns a new pane, like `new_agent`).
+    ToolPicker {
+        step: ToolStep,
+        chosen: Option<usize>,
+    },
 }
 
 /// Which step of the agent-spawn flow we're in.
@@ -42,6 +51,15 @@ pub enum NewAgentStep {
     Share,
 }
 
+/// Which step of the tool-picker flow we're in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolStep {
+    /// Choosing which tool to run.
+    Pick,
+    /// A `run` tool is chosen; asking whether its new pane shares context.
+    Share,
+}
+
 /// What `main.rs` should do once a modal produces an action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModalAction {
@@ -49,6 +67,10 @@ pub enum ModalAction {
     SpawnShell { shared: bool },
     /// Spawn the configured agent at `index`, shared or isolated.
     SpawnAgent { index: usize, shared: bool },
+    /// Run the configured tool at `index`. For a `prompt` tool `shared` is
+    /// always `false` (it types into the active pane, no new pane); for a
+    /// `run` tool it carries the share/isolate answer from the picker.
+    RunTool { index: usize, shared: bool },
     /// Send the source pane's screen text to the shared pane at `target`.
     Send { target: usize },
     /// Cancel the modal; nothing else happens.
@@ -58,15 +80,17 @@ pub enum ModalAction {
 impl Modal {
     /// Route a key press to the open modal.
     ///
-    /// `agents` is the configured agent list (drives the picker); `targets` is
-    /// the already-filtered list of pane indices that can receive a relay from
-    /// the active pane — shared, alive, and not the source (see
+    /// `agents` is the configured agent list (drives the agent picker);
+    /// `tools` is the configured tool list (drives the tool picker); `targets`
+    /// is the already-filtered list of pane indices that can receive a relay
+    /// from the active pane — shared, alive, and not the source (see
     /// [`send_targets`]). Returns `Some(action)` when the key completes the
     /// flow, `None` when it moves to another state or is swallowed.
     pub fn handle_key(
         &mut self,
         key: &KeyEvent,
         agents: &[Agent],
+        tools: &[Tool],
         targets: &[usize],
     ) -> Option<ModalAction> {
         match self {
@@ -117,12 +141,56 @@ impl Modal {
                 KeyCode::Esc => Some(ModalAction::Cancel),
                 _ => None,
             },
+            Modal::ToolPicker { step, chosen } => match (*step, key.code) {
+                (ToolStep::Pick, KeyCode::Char(c @ '1'..='9')) => {
+                    let i = (c as usize - '0' as usize) - 1;
+                    match tools.get(i) {
+                        // A `prompt` tool fires immediately — it types into the
+                        // active pane, so there is no share question.
+                        Some(Tool {
+                            kind: ToolKind::Prompt,
+                            ..
+                        }) => Some(ModalAction::RunTool {
+                            index: i,
+                            shared: false,
+                        }),
+                        // A `run` tool spawns a new pane, so it defers to the
+                        // y/n share question.
+                        Some(Tool {
+                            kind: ToolKind::Run,
+                            ..
+                        }) => {
+                            *self = Modal::ToolPicker {
+                                step: ToolStep::Share,
+                                chosen: Some(i),
+                            };
+                            None
+                        }
+                        // Out-of-range digit: swallowed.
+                        _ => None,
+                    }
+                }
+                (ToolStep::Share, KeyCode::Char('y')) if chosen.is_some() => Some(
+                    ModalAction::RunTool {
+                        index: chosen.unwrap(),
+                        shared: true,
+                    },
+                ),
+                (ToolStep::Share, KeyCode::Char('n')) if chosen.is_some() => Some(
+                    ModalAction::RunTool {
+                        index: chosen.unwrap(),
+                        shared: false,
+                    },
+                ),
+                (_, KeyCode::Esc) => Some(ModalAction::Cancel),
+                _ => None,
+            },
         }
     }
 
     /// The overlay line(s) for the current modal state, rendered at the
     /// bottom of the frame. Empty when no modal is open.
-    pub fn prompt(&self, app: &App, agents: &[Agent]) -> Vec<Line<'_>> {
+    pub fn prompt(&self, app: &App, agents: &[Agent], tools: &[Tool]) -> Vec<Line<'_>> {
         match self {
             Modal::None => Vec::new(),
             Modal::NewPaneShare => vec![Line::from(
@@ -165,6 +233,22 @@ impl Modal {
                     .collect();
                 vec![send_target_line(*source, src_name, &pairs)]
             }
+            Modal::ToolPicker {
+                step: ToolStep::Pick,
+                ..
+            } => vec![Line::from(tool_pick_line(tools))],
+            Modal::ToolPicker {
+                step: ToolStep::Share,
+                chosen,
+            } => {
+                let name = chosen
+                    .and_then(|i| tools.get(i))
+                    .map(|t| t.name.as_str())
+                    .unwrap_or("tool");
+                vec![Line::from(format!(
+                    " run tool ({name}) — share context with other panes?  [y] share   [n] isolate   (esc) cancel"
+                ))]
+            }
         }
     }
 }
@@ -177,6 +261,18 @@ fn new_agent_pick_line(agents: &[Agent]) -> String {
         s.push_str(&format!("[{}] {}   ", i + 1, agent.name));
     }
     s.push_str("[s] plain shell   (esc) cancel");
+    s
+}
+
+/// The single overlay line for the tool picker: one `[n] name` entry per
+/// configured tool. (Unlike the agent picker there is no `[s]` option — a
+/// tool is never a plain shell.)
+fn tool_pick_line(tools: &[Tool]) -> String {
+    let mut s = String::from(" run tool — pick:  ");
+    for (i, tool) in tools.iter().enumerate() {
+        s.push_str(&format!("[{}] {}   ", i + 1, tool.name));
+    }
+    s.push_str("(esc) cancel");
     s
 }
 
@@ -236,7 +332,7 @@ mod tests {
     fn new_pane_share_y_spawns_shared() {
         let mut m = Modal::NewPaneShare;
         assert_eq!(
-            m.handle_key(&key('y'), &[], &[]),
+            m.handle_key(&key('y'), &[], &[], &[]),
             Some(ModalAction::SpawnShell { shared: true })
         );
     }
@@ -245,7 +341,7 @@ mod tests {
     fn new_pane_share_n_spawns_isolated() {
         let mut m = Modal::NewPaneShare;
         assert_eq!(
-            m.handle_key(&key('n'), &[], &[]),
+            m.handle_key(&key('n'), &[], &[], &[]),
             Some(ModalAction::SpawnShell { shared: false })
         );
     }
@@ -253,13 +349,13 @@ mod tests {
     #[test]
     fn new_pane_share_esc_cancels() {
         let mut m = Modal::NewPaneShare;
-        assert_eq!(m.handle_key(&esc(), &[], &[]), Some(ModalAction::Cancel));
+        assert_eq!(m.handle_key(&esc(), &[], &[], &[]), Some(ModalAction::Cancel));
     }
 
     #[test]
     fn new_pane_share_unknown_is_swallowed() {
         let mut m = Modal::NewPaneShare;
-        assert_eq!(m.handle_key(&key('x'), &[], &[]), None);
+        assert_eq!(m.handle_key(&key('x'), &[], &[], &[]), None);
         assert_eq!(m, Modal::NewPaneShare);
     }
 
@@ -271,7 +367,7 @@ mod tests {
             step: NewAgentStep::Pick,
             chosen: None,
         };
-        assert_eq!(m.handle_key(&key('2'), &agents(), &[]), None);
+        assert_eq!(m.handle_key(&key('2'), &agents(), &[], &[]), None);
         assert_eq!(
             m,
             Modal::NewAgent {
@@ -287,7 +383,7 @@ mod tests {
             step: NewAgentStep::Pick,
             chosen: None,
         };
-        assert_eq!(m.handle_key(&key('3'), &agents(), &[]), None);
+        assert_eq!(m.handle_key(&key('3'), &agents(), &[], &[]), None);
         assert_eq!(
             m,
             Modal::NewAgent {
@@ -303,7 +399,7 @@ mod tests {
             step: NewAgentStep::Pick,
             chosen: None,
         };
-        assert_eq!(m.handle_key(&key('s'), &agents(), &[]), None);
+        assert_eq!(m.handle_key(&key('s'), &agents(), &[], &[]), None);
         assert_eq!(m, Modal::NewPaneShare);
     }
 
@@ -314,7 +410,7 @@ mod tests {
             chosen: None,
         };
         assert_eq!(
-            m.handle_key(&esc(), &agents(), &[]),
+            m.handle_key(&esc(), &agents(), &[], &[]),
             Some(ModalAction::Cancel)
         );
     }
@@ -328,7 +424,7 @@ mod tests {
             chosen: Some(0),
         };
         assert_eq!(
-            m.handle_key(&key('y'), &agents(), &[]),
+            m.handle_key(&key('y'), &agents(), &[], &[]),
             Some(ModalAction::SpawnAgent {
                 index: 0,
                 shared: true
@@ -343,7 +439,7 @@ mod tests {
             chosen: Some(1),
         };
         assert_eq!(
-            m.handle_key(&key('n'), &agents(), &[]),
+            m.handle_key(&key('n'), &agents(), &[], &[]),
             Some(ModalAction::SpawnAgent {
                 index: 1,
                 shared: false
@@ -358,7 +454,7 @@ mod tests {
             chosen: Some(0),
         };
         assert_eq!(
-            m.handle_key(&esc(), &agents(), &[]),
+            m.handle_key(&esc(), &agents(), &[], &[]),
             Some(ModalAction::Cancel)
         );
     }
@@ -370,7 +466,7 @@ mod tests {
         let mut m = Modal::SendTarget { source: 0 };
         // Filtered targets are panes 1 and 3; digit '2' → pane 3.
         assert_eq!(
-            m.handle_key(&key('2'), &[], &[1, 3]),
+            m.handle_key(&key('2'), &[], &[], &[1, 3]),
             Some(ModalAction::Send { target: 3 })
         );
     }
@@ -378,7 +474,7 @@ mod tests {
     #[test]
     fn send_target_digit_out_of_range_is_swallowed() {
         let mut m = Modal::SendTarget { source: 0 };
-        assert_eq!(m.handle_key(&key('3'), &[], &[1]), None);
+        assert_eq!(m.handle_key(&key('3'), &[], &[], &[1]), None);
         assert_eq!(m, Modal::SendTarget { source: 0 });
     }
 
@@ -386,7 +482,7 @@ mod tests {
     fn send_target_esc_cancels() {
         let mut m = Modal::SendTarget { source: 0 };
         assert_eq!(
-            m.handle_key(&esc(), &[], &[1]),
+            m.handle_key(&esc(), &[], &[], &[1]),
             Some(ModalAction::Cancel)
         );
     }
@@ -396,8 +492,8 @@ mod tests {
     #[test]
     fn none_swallows_everything() {
         let mut m = Modal::None;
-        assert_eq!(m.handle_key(&key('y'), &[], &[]), None);
-        assert_eq!(m.handle_key(&esc(), &[], &[]), None);
+        assert_eq!(m.handle_key(&key('y'), &[], &[], &[]), None);
+        assert_eq!(m.handle_key(&esc(), &[], &[], &[]), None);
         assert_eq!(m, Modal::None);
     }
 

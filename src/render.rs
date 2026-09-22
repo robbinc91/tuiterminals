@@ -107,10 +107,27 @@ pub fn draw_panes(
             title.push(Span::raw(" (private)"));
         }
         let title = Line::from(title);
+        // The bottom border carries the pane's own CPU/RAM (from
+        // `res.panes`, in pane order) so the top identity line stays clean.
+        // A dead pane's child is gone, so it gets no bottom title.
+        let title_bottom = if pane.alive {
+            res.panes
+                .get(i)
+                .map(|pr| {
+                    Line::from(format!(
+                        "CPU {:>3.0}%  RAM {}",
+                        pr.cpu,
+                        format_bytes_gb(pr.mem)
+                    ))
+                })
+        } else {
+            None
+        };
         frame.render_widget(
             Block::bordered()
                 .border_style(border)
-                .title(title),
+                .title(title)
+                .title_bottom(title_bottom.unwrap_or_default()),
             *rect,
         );
     }
@@ -139,7 +156,7 @@ pub fn draw_panes(
 /// Render the open modal's prompt line(s) in a black-background bar pinned to
 /// the bottom of the frame. Does nothing when no modal is open.
 fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
-    let lines = modal.prompt(app, &app.agents);
+    let lines = modal.prompt(app, &app.agents, &app.tools);
     if lines.is_empty() {
         return;
     }
@@ -217,9 +234,13 @@ fn draw_term(buffer: &mut Buffer, pane: &Pane, inner: Rect, active: bool) {
     let colors = content.colors;
     let default_fg = colors[256]; // Foreground
     let default_bg = colors[257]; // Background
+    // When the pane is scrolled up into history, `display_iter` yields
+    // negative `Line`s for rows above the live screen; shifting each by
+    // `display_offset` maps them back into the visible range.
+    let offset = content.display_offset as i32;
 
     for indexed in content.display_iter {
-        let row = indexed.point.line.0 as usize;
+        let row = (indexed.point.line.0 + offset) as usize;
         let col = indexed.point.column.0;
         if row >= inner.height as usize || col >= inner.width as usize {
             continue;
@@ -244,7 +265,9 @@ fn draw_term(buffer: &mut Buffer, pane: &Pane, inner: Rect, active: bool) {
         target.set_style(style);
     }
 
-    if active {
+    // The live cursor only makes sense on the live screen; while the user is
+    // reading history (`display_offset > 0`) there is no cursor to draw.
+    if active && content.display_offset == 0 {
         let cursor = &content.cursor;
         if cursor.shape != CursorShape::Hidden {
             let row = cursor.point.line.0 as usize;

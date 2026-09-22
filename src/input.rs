@@ -13,14 +13,19 @@ pub enum GlobalKey {
     PrevPane,
     NextPane,
     NewAgent,
+    RunTool,
     SendContext,
     BroadcastContext,
     DumpContext,
+    ScrollUp,
+    ScrollDown,
+    ScrollTop,
+    ScrollBottom,
 }
 
 /// Interpret a key press as a global binding, if one matches.
 ///
-/// The nine bindings are checked in a fixed order (first match wins), so a
+/// The fourteen bindings are checked in a fixed order (first match wins), so a
 /// key that matches two configured bindings resolves to the earlier one.
 pub fn handle_global(key: &KeyEvent, kb: &Keybindings) -> Option<GlobalKey> {
     if kb.new_pane.matches(key) {
@@ -41,6 +46,9 @@ pub fn handle_global(key: &KeyEvent, kb: &Keybindings) -> Option<GlobalKey> {
     if kb.new_agent.matches(key) {
         return Some(GlobalKey::NewAgent);
     }
+    if kb.run_tool.matches(key) {
+        return Some(GlobalKey::RunTool);
+    }
     if kb.send_context.matches(key) {
         return Some(GlobalKey::SendContext);
     }
@@ -49,6 +57,18 @@ pub fn handle_global(key: &KeyEvent, kb: &Keybindings) -> Option<GlobalKey> {
     }
     if kb.dump_context.matches(key) {
         return Some(GlobalKey::DumpContext);
+    }
+    if kb.scroll_up.matches(key) {
+        return Some(GlobalKey::ScrollUp);
+    }
+    if kb.scroll_down.matches(key) {
+        return Some(GlobalKey::ScrollDown);
+    }
+    if kb.scroll_top.matches(key) {
+        return Some(GlobalKey::ScrollTop);
+    }
+    if kb.scroll_bottom.matches(key) {
+        return Some(GlobalKey::ScrollBottom);
     }
     None
 }
@@ -96,4 +116,60 @@ pub fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
     }
 
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEventKind, KeyEventState};
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn scroll_defaults_route_to_scroll_actions() {
+        let kb = Keybindings::default();
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert_eq!(
+            handle_global(&key(KeyCode::Up, ctrl_shift), &kb),
+            Some(GlobalKey::ScrollUp)
+        );
+        assert_eq!(
+            handle_global(&key(KeyCode::Down, ctrl_shift), &kb),
+            Some(GlobalKey::ScrollDown)
+        );
+        assert_eq!(
+            handle_global(&key(KeyCode::Home, ctrl_shift), &kb),
+            Some(GlobalKey::ScrollTop)
+        );
+        assert_eq!(
+            handle_global(&key(KeyCode::End, ctrl_shift), &kb),
+            Some(GlobalKey::ScrollBottom)
+        );
+    }
+
+    #[test]
+    fn scroll_bindings_require_exact_modifiers() {
+        let kb = Keybindings::default();
+        // A bare arrow key (no ctrl+shift) is not a scroll binding.
+        assert_eq!(handle_global(&key(KeyCode::Up, KeyModifiers::NONE), &kb), None);
+    }
+
+    #[test]
+    fn run_tool_default_routes_to_run_tool() {
+        let kb = Keybindings::default();
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert_eq!(
+            handle_global(&key(KeyCode::Char('t'), ctrl_shift), &kb),
+            Some(GlobalKey::RunTool)
+        );
+        // A bare `t` (no modifiers) is not a binding.
+        assert_eq!(handle_global(&key(KeyCode::Char('t'), KeyModifiers::NONE), &kb), None);
+    }
 }

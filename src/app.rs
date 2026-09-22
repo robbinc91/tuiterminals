@@ -14,7 +14,8 @@ use alacritty_terminal::vte;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem};
 
-use crate::config::{Agent, Config, Shell};
+use crate::config::{Agent, Config, Shell, Tool, ToolKind};
+use crate::session::Session;
 
 /// How long a pane may be quiet before it reads as "idle" rather than "working".
 /// A shell sitting at a prompt is idle; a worker streaming output is working.
@@ -33,9 +34,12 @@ pub enum PaneStatus {
 
 /// Dimensions handed to `Term::new` / `Term::resize`.
 ///
-/// v1 has no scrollback: `total_lines == screen_lines`, so the grid's
-/// `display_offset` is always 0 and `display_iter` covers exactly the
-/// visible screen.
+/// `total_lines == screen_lines`: the scrollback history is *not* part of
+/// these dimensions — it is driven by `TermConfig.scrolling_history` (the
+/// config's `scrollback_lines`). While `display_offset` is 0, `display_iter`
+/// covers exactly the visible screen; when the pane is scrolled up into
+/// history, `display_iter` yields negative `Line`s for rows above the live
+/// screen and the renderers map them back into the visible range.
 #[derive(Copy, Clone, Debug)]
 pub struct TermSize {
     pub rows: u16,
@@ -62,11 +66,13 @@ impl Dimensions for TermSize {
     }
 }
 
-/// What a pane runs: a plain shell, or one of the configured agents by index.
+/// What a pane runs: a plain shell, one of the configured agents by index, or
+/// a `run`-kind tool by index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Launch {
     Shell,
     Agent(usize),
+    Tool(usize),
 }
 
 impl App {
@@ -80,16 +86,70 @@ impl App {
     ) -> anyhow::Result<Self> {
         let launch_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let command = Self::shell_command(&config.shell);
-        let pane = Pane::new(&*pty_system, size, &command, None, &launch_dir, true)?;
-        Ok(Self {
-            panes: vec![pane],
+        let pane = Pane::new(
+            &*pty_system,
+            size,
+            &command,
+            None,
+            Launch::Shell,
+            &launch_dir,
+            true,
+            config.scrollback_lines,
+        )?;
+        Ok(Self::build(pty_system, vec![pane], config, launch_dir))
+    }
+
+    /// Rebuild the app from a saved session: one fresh pane per saved pane
+    /// (capped at `max_panes`), each re-launched in its last directory. A saved
+    /// agent that no longer exists in the config falls back to a plain shell, so
+    /// a stale session never fails a spawn. The first pane is always shared — the
+    /// root of the context bus. Every pane is created at `size` (the full area);
+    /// the caller reflows to per-pane layout slots afterwards.
+    pub fn from_session(
+        pty_system: Box<dyn PtySystem + Send>,
+        size: TermSize,
+        config: &Config,
+        session: &Session,
+    ) -> anyhow::Result<Self> {
+        let launch_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut app = Self::build(pty_system, Vec::new(), config, launch_dir);
+        for (i, sp) in session.panes.iter().take(app.max_panes).enumerate() {
+            let launch = Self::resolve_launch(&sp.launch, &app.agents, &app.tools);
+            let (command, agent_name) = app.command_for(&launch, Path::new(&sp.cwd));
+            let shared = i == 0 || sp.shared;
+            app.panes.push(Pane::new(
+                &*app.pty_system,
+                size,
+                &command,
+                agent_name.as_deref(),
+                launch,
+                Path::new(&sp.cwd),
+                shared,
+                app.scrollback,
+            )?);
+        }
+        Ok(app)
+    }
+
+    /// Shared App-struct construction for [`App::new`] and [`App::from_session`]
+    /// — only the pane list differs between the two.
+    fn build(
+        pty_system: Box<dyn PtySystem + Send>,
+        panes: Vec<Pane>,
+        config: &Config,
+        launch_dir: PathBuf,
+    ) -> Self {
+        Self {
+            panes,
             active: 0,
             pty_system,
             max_panes: config.max_panes,
+            scrollback: config.scrollback_lines,
             shell: config.shell.clone(),
             agents: config.agents.clone(),
+            tools: config.tools.clone(),
             launch_dir,
-        })
+        }
     }
 
     /// The `CommandBuilder` for the configured shell (or the platform default).
@@ -106,10 +166,13 @@ impl App {
         }
     }
 
-    /// Resolve `launch` to the command to spawn plus the agent's display name
-    /// (`None` for a plain shell). An out-of-range agent index falls back to
-    /// the shell so a stale picker pick can never crash a spawn.
-    fn command_for(&self, launch: &Launch) -> (CommandBuilder, Option<String>) {
+    /// The command a launch runs, and the name to show in the pane's border
+    /// (the agent's or tool's name, or `None` for a plain shell). An index
+    /// that no longer resolves (config changed since the pane was spawned)
+    /// degrades to a plain shell. `cwd` is the directory the new pane starts
+    /// in; a `run` tool's arguments are placeholder-expanded against it and
+    /// the active pane's current screen.
+    fn command_for(&self, launch: &Launch, cwd: &Path) -> (CommandBuilder, Option<String>) {
         match launch {
             Launch::Shell => (Self::shell_command(&self.shell), None),
             Launch::Agent(i) => match self.agents.get(*i) {
@@ -122,7 +185,44 @@ impl App {
                 }
                 None => (Self::shell_command(&self.shell), None),
             },
+            Launch::Tool(i) => match self.tools.get(*i) {
+                // A `run` tool spawns its program; a `prompt` tool (or an
+                // index that no longer resolves) degrades to a plain shell.
+                Some(tool) if tool.kind == ToolKind::Run => {
+                    let screen = self
+                        .panes
+                        .get(self.active)
+                        .map(|p| p.screen_text())
+                        .unwrap_or_default();
+                    let mut cmd = CommandBuilder::new(tool.program.as_ref().unwrap());
+                    for arg in &tool.args {
+                        cmd.arg(expand_placeholders(arg, cwd, &screen));
+                    }
+                    (cmd, Some(tool.name.clone()))
+                }
+                _ => (Self::shell_command(&self.shell), None),
+            },
         }
+    }
+
+    /// Map a stored launch string back to a [`Launch`]: `"shell"` and
+    /// anything unrecognized are a plain shell; `"agent:<name>"` and
+    /// `"tool:<name>"` are the configured agent/tool with that name, or a
+    /// plain shell if it no longer exists.
+    fn resolve_launch(stored: &str, agents: &[Agent], tools: &[Tool]) -> Launch {
+        if let Some(name) = stored.strip_prefix("agent:") {
+            return agents
+                .iter()
+                .position(|a| a.name == name)
+                .map_or(Launch::Shell, Launch::Agent);
+        }
+        if let Some(name) = stored.strip_prefix("tool:") {
+            return tools
+                .iter()
+                .position(|t| t.name == name)
+                .map_or(Launch::Shell, Launch::Tool);
+        }
+        Launch::Shell
     }
 
     /// Feed all pending PTY output into each pane's VT processor, then write
@@ -185,14 +285,16 @@ impl App {
             .get(self.active)
             .map(|p| p.cwd.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let (command, agent_name) = self.command_for(launch);
+        let (command, agent_name) = self.command_for(launch, &cwd);
         self.panes.push(Pane::new(
             &*self.pty_system,
             size,
             &command,
             agent_name.as_deref(),
+            *launch,
             &cwd,
             shared,
+            self.scrollback,
         )?);
         Ok(self.panes.len() - 1)
     }
@@ -221,6 +323,16 @@ impl App {
 
     pub fn all_dead(&self) -> bool {
         self.panes.iter().all(|p| !p.alive)
+    }
+
+    /// Each pane's child PID, in pane order, for the resource sampler. A
+    /// child whose PID is unknown (or already reaped) reads as `0`, which the
+    /// sampler resolves to zeros.
+    pub fn pane_pids(&self) -> Vec<u32> {
+        self.panes
+            .iter()
+            .map(|p| p.child.process_id().unwrap_or(0))
+            .collect()
     }
 
     /// Send the active pane's visible screen into pane `target`. No-op unless
@@ -300,6 +412,29 @@ impl App {
         }
     }
 
+    /// Fire a `prompt` tool at the active pane: expand `{cwd}` and `{screen}`
+    /// in its template and write the result into the pane's PTY, wrapped in
+    /// bracketed-paste markers, with no trailing Enter (the relay convention).
+    /// Only a shared, alive active pane may be the target; anything else is a
+    /// no-op. `run` tools are spawned as panes instead (see [`Launch::Tool`]).
+    pub fn run_tool(&mut self, index: usize) {
+        let Some(tool) = self.tools.get(index).filter(|t| t.kind == ToolKind::Prompt) else {
+            return;
+        };
+        let Some(text) = tool.text.as_deref() else {
+            return;
+        };
+        let Some(pane) = self.panes.get_mut(self.active) else {
+            return;
+        };
+        if !pane.shared || !pane.alive {
+            return;
+        }
+        let screen = screen_text(&pane.term);
+        let expanded = expand_placeholders(text, &pane.cwd, &screen);
+        let _ = pane.writer.write_all(&paste_wrap(&expanded));
+    }
+
     /// Type the shared-context pointer line into pane `index` (no Enter).
     /// Shared panes only — an isolated pane is off the bus and gets nothing.
     pub fn note_shared_context(&mut self, index: usize) {
@@ -320,9 +455,13 @@ pub struct App {
     pub active: usize,
     pty_system: Box<dyn PtySystem + Send>,
     max_panes: usize,
+    /// Scrollback lines each pane's grid keeps above the visible screen.
+    scrollback: usize,
     shell: Option<Shell>,
     /// Configured agents (the `[[agents]]` config section), by picker index.
     pub agents: Vec<Agent>,
+    /// Configured tools (the `[[tools]]` config section), by picker index.
+    pub tools: Vec<Tool>,
     /// The directory the app was launched from; `CONTEXT.md` lives here.
     launch_dir: PathBuf,
 }
@@ -370,6 +509,10 @@ pub struct Pane {
     /// The configured agent's display name, for the border title. `None`
     /// for a plain shell.
     pub agent_name: Option<String>,
+    /// What this pane runs (a plain shell, a configured agent, or a `run`
+    /// tool). Kept so a saved session can re-resolve the same launch on
+    /// restore.
+    pub launch: Launch,
     /// The directory this pane's shell is believed to be in. Seeded with the
     /// launch dir and updated as the user types `cd` commands (see
     /// [`Pane::observe_key`]). A new pane starts here, so panes "follow" the
@@ -390,14 +533,21 @@ impl Pane {
     /// Open a PTY of `size`, spawn `command` on it, and start a reader thread
     /// that ships raw bytes over an mpsc channel. `agent_name` is the
     /// configured agent's display name (for the border title) or `None` for a
-    /// plain shell; `shared` puts the pane on the context bus.
+    /// plain shell; `launch` records what the pane runs (for session restore);
+    /// `shared` puts the pane on the context bus; `scrollback` is how many
+    /// lines the grid keeps above the visible screen.
+    // Eight genuinely distinct constructor params; `launch` is required for
+    // session restore, so a builder isn't worth the indirection here.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         pty_system: &dyn PtySystem,
         size: TermSize,
         command: &CommandBuilder,
         agent_name: Option<&str>,
+        launch: Launch,
         cwd: &Path,
         shared: bool,
+        scrollback: usize,
     ) -> anyhow::Result<Self> {
         let PtyPair { slave, master } = pty_system.openpty(PtySize {
             rows: size.rows,
@@ -433,7 +583,7 @@ impl Pane {
         });
 
         let term_config = TermConfig {
-            scrolling_history: 0,
+            scrolling_history: scrollback,
             ..Default::default()
         };
         let (pty_tx, pty_rx) = mpsc::channel::<String>();
@@ -451,6 +601,7 @@ impl Pane {
             exit_status: None,
             shared,
             agent_name: agent_name.map(str::to_string),
+            launch,
             cwd: cwd.to_path_buf(),
             line: String::new(),
             last_activity: Instant::now() - IDLE_AFTER,
@@ -501,12 +652,15 @@ impl Pane {
 
 /// Extract the visible grid of `term` as plain text. Kept as a free
 /// function (rather than only a `Pane` method) so it is unit-testable against
-/// a bare `Term` with no live PTY. v1 has no scrollback, so the grid is
-/// exactly the visible screen: bucket each cell's char by its row, skip
-/// hidden/wide-spacer cells, trim trailing spaces per line, and drop trailing
-/// blank lines.
+/// a bare `Term` with no live PTY. The grid is whatever the viewport shows:
+/// when the pane is scrolled up into history, `display_iter` yields negative
+/// `Line`s for rows above the live screen, so each row is shifted by
+/// `display_offset` to land in the visible range. Bucket each cell's char by
+/// its row, skip hidden/wide-spacer cells, trim trailing spaces per line, and
+/// drop trailing blank lines.
 fn screen_text(term: &Term<PtyWriter>) -> String {
     let content = term.renderable_content();
+    let offset = content.display_offset as i32;
     let mut lines: Vec<String> = Vec::new();
     for indexed in content.display_iter {
         if indexed
@@ -516,7 +670,7 @@ fn screen_text(term: &Term<PtyWriter>) -> String {
         {
             continue;
         }
-        let row = indexed.point.line.0 as usize;
+        let row = (indexed.point.line.0 + offset) as usize;
         while lines.len() <= row {
             lines.push(String::new());
         }
@@ -541,6 +695,14 @@ fn paste_wrap(payload: &str) -> Vec<u8> {
     bytes.extend_from_slice(payload.as_bytes());
     bytes.extend_from_slice(b"\x1b[201~");
     bytes
+}
+
+/// Expand `{cwd}` and `{screen}` placeholders in a tool template. Unknown
+/// placeholders (any other `{...}`) are left verbatim.
+fn expand_placeholders(template: &str, cwd: &Path, screen: &str) -> String {
+    template
+        .replace("{cwd}", &cwd.to_string_lossy())
+        .replace("{screen}", screen)
 }
 
 /// Whether pane `index` may take part in a relay whose source is pane
@@ -617,6 +779,7 @@ fn resolve_path(base: &Path, p: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::grid::Scroll;
     use portable_pty::native_pty_system;
 
     /// The Windows ConPTY host emits a lone `\x1b[6n` (cursor position report
@@ -658,6 +821,57 @@ mod tests {
         );
     }
 
+    // --- tools (expand_placeholders / run_tool) ---
+
+    #[test]
+    fn expand_placeholders_replaces_cwd_and_screen() {
+        let cwd = Path::new("/tmp/proj");
+        let out = expand_placeholders(
+            "Explain the code on screen. Cwd: {cwd}",
+            cwd,
+            "some output",
+        );
+        assert_eq!(out, "Explain the code on screen. Cwd: /tmp/proj");
+        let out2 = expand_placeholders("screen says: {screen}", cwd, "hello");
+        assert_eq!(out2, "screen says: hello");
+    }
+
+    #[test]
+    fn expand_placeholders_leaves_unknown_verbatim() {
+        let out = expand_placeholders("{cwd} and {x}", Path::new("/a"), "s");
+        assert_eq!(out, "/a and {x}");
+    }
+
+    #[test]
+    fn run_tool_prompt_types_expanded_template_into_active_pane() {
+        let size = TermSize::new(24, 80);
+        let mut config = Config::default();
+        config.tools = vec![Tool {
+            name: "explain".into(),
+            kind: ToolKind::Prompt,
+            program: None,
+            args: vec![],
+            text: Some("Explain the code on screen. Cwd: {cwd}".into()),
+        }];
+        let mut app = App::new(native_pty_system(), size, &config).unwrap();
+        app.run_tool(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut ok = false;
+        while !ok && std::time::Instant::now() < deadline {
+            app.pump();
+            app.check_children();
+            if screen_text(&app.panes[0].term).contains("Explain the code on screen") {
+                ok = true;
+            }
+        }
+        for pane in &mut app.panes {
+            if pane.alive {
+                let _ = pane.child.kill();
+            }
+        }
+        assert!(ok, "the expanded prompt template never reached the pane's grid");
+    }
+
     // --- context sharing (screen_text / paste_wrap / relayable) ---
 
     #[test]
@@ -675,6 +889,37 @@ mod tests {
         let mut processor: vte::ansi::Processor = vte::ansi::Processor::new();
         processor.advance(&mut term, b"hello\r\nworld");
         assert_eq!(screen_text(&term), "hello\nworld");
+    }
+
+    /// With scrollback, `display_iter` yields negative `Line`s for rows above
+    /// the live screen. `screen_text` must map them back through
+    /// `display_offset` so a scrolled-up pane reports the *visible* historical
+    /// rows, not the live screen (and not the pre-fix garbage of a wrapped
+    /// negative index).
+    #[test]
+    fn screen_text_returns_visible_rows_when_scrolled_up() {
+        let (tx, _rx) = mpsc::channel::<String>();
+        let size = TermSize::new(5, 10);
+        let mut term = Term::new(
+            TermConfig {
+                scrolling_history: 10,
+                ..Default::default()
+            },
+            &size,
+            PtyWriter { tx },
+        );
+        let mut processor: vte::ansi::Processor = vte::ansi::Processor::new();
+        // 8 rows in a 5-row screen: L0..L2 scroll into history, L3..L7 stay live.
+        processor.advance(
+            &mut term,
+            b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7",
+        );
+        // Live screen (display_offset == 0) shows the bottom five rows.
+        assert_eq!(screen_text(&term), "L3\nL4\nL5\nL6\nL7");
+
+        // Scroll up into history; the visible window becomes L0..L4.
+        term.scroll_display(Scroll::Delta(3));
+        assert_eq!(screen_text(&term), "L0\nL1\nL2\nL3\nL4");
     }
 
     #[test]

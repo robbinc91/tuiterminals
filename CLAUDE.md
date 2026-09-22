@@ -10,10 +10,10 @@ rendering each pane. The name is "TUI" + "terminals".
 
 **Current state:** a working v1. The app opens a grid of panes (1–4), each running its
 own shell — or a configured agent — in a PTY, and renders each pane's alacritty cell
-grid. Global keybindings manage the panes (new / kill / quit / cycle), and panes can
-share context with each other — see [Context sharing](#context-sharing). A TOML config
-file makes the shell, agents, keybindings, border colors, and pane cap configurable — see
-[Configuration](#configuration).
+grid. Global keybindings manage the panes (new / kill / quit / cycle / scroll), and
+panes can share context with each other — see [Context sharing](#context-sharing). A
+TOML config file makes the shell, agents, keybindings, border colors, and pane cap
+configurable — see [Configuration](#configuration).
 
 ## Commands
 
@@ -28,7 +28,7 @@ cargo clippy       # lints (no clippy config; defaults apply)
 cargo build --release
 ```
 
-Tests live in four modules, all run by `cargo test`:
+Tests live in five modules, all run by `cargo test`:
 - `src/config.rs` — key-combo parsing, color parsing, and `Config::load` against temp
   files (fast, no I/O beyond temp files).
 - `src/app.rs` — the `apply_cd`/`resolve_path` cwd-tracking logic, the
@@ -37,9 +37,12 @@ Tests live in four modules, all run by `cargo test`:
   in a PTY and pumps it for up to 5s until output reaches the grid. It is the regression
   guard for the ConPTY stall (see [Windows ConPTY quirk](#windows-conpty-quirk)) and is
   the slow test in the suite.
+- `src/input.rs` — the scroll-binding routing: the four scroll defaults resolve to the
+  scroll actions, and a bare arrow key (no modifiers) does not.
 - `src/ui.rs` — every modal transition (share/isolate, agent picker, send-target) and
   the prompt-line strings.
-- `src/resources.rs` — the `nvidia-smi` VRAM output parser.
+- `src/resources.rs` — the `nvidia-smi` VRAM output parser, plus a check that
+  `Sampler::tick` resolves pane PIDs into per-pane CPU/RAM usage.
 
 No CI and no formatter config yet. Run a single test with `cargo test <name>` (e.g.
 `cargo test apply_cd`).
@@ -57,19 +60,27 @@ Six modules, one per concern. The data flow that ties them together:
 `crossterm` events drive the main loop and forward keystrokes back into the active PTY.
 
 - **`src/main.rs`** — entry point and the event loop. Sets up raw mode + alternate
-  screen, installs a panic hook that restores the outer terminal, then loops:
+  screen, enables mouse capture (released again on every exit path — normal and panic),
+  installs a panic hook that restores the outer terminal, then loops:
   `app.pump()` (drain PTY output into each term) → `app.check_children()` (reap
   exited shells) → poll crossterm → route the event → draw. `reflow()` recomputes the
   pane layout and resizes every pane's grid + PTY on terminal resize. While a modal is
   open (see `src/ui.rs`) every key press routes to it instead of the global bindings or
-  the panes; a completed modal action spawns a pane or sends a relay.
+  the panes; a completed modal action spawns a pane or sends a relay. Mouse-wheel events
+  scroll the active pane's grid (3 lines per notch), gated the same way — a modal open
+  swallows them.
 - **`src/app.rs`** — `App` (the pane list, active index, PTY system, `max_panes`, the
   configured `shell`, the configured `agents`, and the `launch_dir` where `CONTEXT.md`
   lives) and `Pane` (an alacritty `Term`, a `vte` `Processor`, the reader channel, the
   PTY writer/master, the child handle, plus `shared` — is the pane on the context bus —
   and `agent_name` for the border title). `TermSize` implements alacritty's
-  `Dimensions`. v1 has no scrollback (`scrolling_history: 0`), so the grid is exactly
-  the visible screen.
+  `Dimensions`. Each pane's grid carries a scrollback history sized by the config's
+  `scrollback_lines` (default 10000, via `TermConfig.scrolling_history`); `TermSize`
+  needs no change — history is driven by `scrolling_history`, not `Dimensions::total_lines`.
+  When a pane is scrolled up into history, `display_iter` yields negative `Line`s for rows
+  above the live screen; both `draw_term` (render.rs) and `screen_text` map them back into
+  the visible range by adding `content.display_offset`, and the live cursor is suppressed
+  while `display_offset > 0`.
   - **cwd tracking** — each `Pane` keeps a shadow `cwd` and a per-keystroke `line`
     buffer. `Pane::observe_key` (called from `main.rs` before forwarding a key to the
     active pane) mirrors the shell's line editor: on Enter, if the line is a `cd`/`pushd`
@@ -89,9 +100,10 @@ Six modules, one per concern. The data flow that ties them together:
     newly spawned shared pane. The `relayable` predicate keeps the target filter
     unit-testable.
 - **`src/input.rs`** — `handle_global` matches a key against the configured
-  `Keybindings` (first match wins) to decide app-level actions; `key_to_bytes` encodes
-  any other key press into the bytes a terminal would send to the shell (Ctrl+letter →
-  ASCII control codes, arrows/F-keys → escape sequences, Alt → ESC prefix).
+  `Keybindings` (fourteen actions, first match wins — the four scroll actions are
+  checked last) to decide app-level actions; `key_to_bytes` encodes any other key press
+  into the bytes a terminal would send to the shell (Ctrl+letter → ASCII control codes,
+  arrows/F-keys → escape sequences, Alt → ESC prefix).
 - **`src/ui.rs`** — the modal state machine: `Modal` (the share/isolate question, the
   agent picker, the send-target picker), `ModalAction`, `handle_key` (routes a key
   press to the open modal — Esc always cancels, unknown keys are swallowed), and
@@ -102,7 +114,9 @@ Six modules, one per concern. The data flow that ties them together:
   resource bar, the bottom modal prompt overlay, and the alacritty→ratatui
   color/flag translation.
 - **`src/resources.rs`** — the top resource bar's sampler: `sysinfo` for CPU/RAM and an
-  off-main-thread `nvidia-smi` probe for VRAM (1s gate, non-blocking).
+  off-main-thread `nvidia-smi` probe for VRAM (1s gate, non-blocking). Each tick also
+  resolves the panes' child PIDs (fed from `App::pane_pids`) into per-pane CPU/RAM,
+  which `render.rs` draws in each alive pane's bottom border.
 - **`src/config.rs`** — the TOML config subsystem (below).
 
 ## Windows ConPTY quirk
@@ -127,7 +141,7 @@ fills the absent fields with the same defaults — so no config file means the a
 behaves exactly as it did before config existed. A present-but-malformed file is a
 hard error.
 
-The five knobs:
+The eight knobs:
 
 - **`[shell]`** — `program` + `args`; each pane spawns this. Absent → the platform
   default shell (`CommandBuilder::new_default_prog()`).
@@ -135,20 +149,39 @@ The five knobs:
   as repeated `[[agents]]` tables. Each is spawnable into a pane from the agent picker
   (see [Context sharing](#context-sharing)). Absent → the picker offers a plain shell
   only.
-- **`[keybindings]`** — the nine global actions (`new_pane`, `kill_pane`, `quit`,
-  `prev_pane`, `next_pane`, `new_agent`, `send_context`, `broadcast_context`,
-  `dump_context`), each a key-combo string like `"ctrl+n"` or `"ctrl+shift+s"`. Parsed
-  by `parse_combo`; a binding matches only when the key code and all four modifier bits
-  match exactly (so `ctrl+n` does not also fire on `shift+ctrl+n`).
+- **`[[tools]]`** — a list of named one-shot tools (`name`, `kind`, and either
+  `program`/`args` for a `run` tool or `text` for a `prompt` tool), written as repeated
+  `[[tools]]` tables. The `run_tool` binding (default `ctrl+shift+t`) opens a picker of
+  the configured tools: a `run` tool spawns its program in a new pane (then the usual
+  share/isolate question), while a `prompt` tool types its `text` — with `{cwd}` and
+  `{screen}` placeholders expanded — into the active pane. Unlike the other sections a
+  present-but-incomplete entry is a hard error. Absent → no tool picker.
+- **`[keybindings]`** — the fourteen global actions (`new_pane`, `kill_pane`, `quit`,
+  `prev_pane`, `next_pane`, `new_agent`, `run_tool`, `send_context`,
+  `broadcast_context`, `dump_context`, `scroll_up`, `scroll_down`, `scroll_top`,
+  `scroll_bottom`), each a
+  key-combo string like `"ctrl+n"` or `"ctrl+shift+s"`. Parsed by `parse_combo`; a
+  binding matches only when the key code and all four modifier bits match exactly (so
+  `ctrl+n` does not also fire on `shift+ctrl+n`). The scroll bindings (default
+  `ctrl+shift+up/down/home/end`) scroll the active pane's grid; the mouse wheel does the
+  same, 3 lines per notch.
 - **`[colors]`** — `active_border` / `inactive_border`, each a `"#rrggbb"` string.
   These retheme the pane chrome only; a program's own cell colors still come from the
   alacritty palette.
 - **`max_panes`** — the pane cap (default 4).
+- **`scrollback_lines`** — per-pane scrollback history in rows (default 10000,
+  alacritty's own default). Sets `TermConfig.scrolling_history`; a pane scrolled up into
+  history renders the historical rows (see the `src/app.rs` note on `display_offset`
+  mapping above).
+- **`restore_sessions`** — whether the app saves its panes on exit and offers to
+  restore them on the next start (default `true`). See [Session persistence](#session-persistence).
 
 Example:
 
 ```toml
 max_panes = 6
+scrollback_lines = 10000
+restore_sessions = true
 
 [shell]
 program = "powershell"
@@ -164,6 +197,17 @@ name = "codex"
 program = "codex"
 args = []
 
+[[tools]]
+name = "review"
+kind = "run"
+program = "claude"
+args = ["-p", "Review the git diff in {cwd}"]
+
+[[tools]]
+name = "explain"
+kind = "prompt"
+text = "Explain the code on screen. Cwd: {cwd}"
+
 [keybindings]
 new_pane          = "ctrl+n"
 kill_pane         = "ctrl+k"
@@ -171,9 +215,14 @@ quit              = "ctrl+q"
 prev_pane         = "ctrl+left"
 next_pane         = "ctrl+right"
 new_agent         = "ctrl+shift+n"
+run_tool          = "ctrl+shift+t"
 send_context      = "ctrl+shift+s"
 broadcast_context = "ctrl+shift+b"
 dump_context      = "ctrl+shift+c"
+scroll_up         = "ctrl+shift+up"
+scroll_down       = "ctrl+shift+down"
+scroll_top        = "ctrl+shift+home"
+scroll_bottom     = "ctrl+shift+end"
 
 [colors]
 active_border   = "#00ffff"
@@ -213,6 +262,30 @@ TUIs treat the dump as a single paste, and **no trailing Enter is sent** — the
 at the target's prompt and the user decides whether to send it. When a *shared* pane is
 spawned, a pointer line (`shared context: <launch_dir>/CONTEXT.md`) is typed into it so
 the agent knows where the shared file lives.
+
+## Session persistence
+
+tmux-style: on exit the app saves its pane layout, and on the next start it offers
+to bring it back. **Nothing about the live terminal contents is captured** — every
+pane is respawned *fresh* in the directory it was last in. The file is a small TOML
+document at the platform config dir (`~/.config/tuiterminals/session.toml` on Unix,
+`%APPDATA%\tuiterminals\session.toml` on Windows), written by `src/session.rs`.
+
+- **What's saved** — one entry per pane, in pane order: its tracked `cwd`, its launch
+  (a plain `shell`, or a named agent/tool), and whether it was on the context bus.
+  Agents and tools are stored **by name** (`agent:<name>`, `tool:<name>`) rather than
+  by index, so reordering the `[[agents]]`/`[[tools]]` lists in the config never
+  mis-resolves a saved pane. Pane 0 is always written `shared = true` — the bus-root
+  invariant — regardless of its own flag.
+- **Restoring** — `App::from_session` (in `src/app.rs`) rebuilds one fresh pane per
+  saved pane (capped at `max_panes`), each re-launched in its last directory. A saved
+  agent or tool that no longer exists in the config falls back to a plain shell, so a
+  stale session never fails a spawn; the first pane is always shared. `main.rs` reflows
+  afterwards so each pane shrinks from the full area to its layout slot.
+- **Gating** — the `restore_sessions` config knob (default `true`) controls both ends:
+  when off, the app neither reads a session on start nor writes one on exit. A missing
+  or malformed session file is swallowed (falls through to the single-shell-pane
+  default) rather than erroring.
 
 ## Build profile
 

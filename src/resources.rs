@@ -12,8 +12,19 @@ use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
-/// A per-tick snapshot of resource usage.
+/// One pane's child process usage, sampled alongside the system-wide
+/// numbers on each tick.
 #[derive(Debug, Clone, Copy, Default)]
+pub struct PaneRes {
+    /// The child's CPU% over the last refresh window (a delta — valid
+    /// because the sampler refreshes every tick).
+    pub cpu: f32,
+    /// The child's resident memory in bytes.
+    pub mem: u64,
+}
+
+/// A per-tick snapshot of resource usage.
+#[derive(Debug, Clone, Default)]
 pub struct Resources {
     // System-wide.
     pub sys_cpu: f32,
@@ -24,6 +35,8 @@ pub struct Resources {
     // This app's own process.
     pub app_cpu: f32,
     pub app_ram: u64,
+    // One entry per pane, in pane order.
+    pub panes: Vec<PaneRes>,
 }
 
 /// Samples resource usage on a 1-second gate.
@@ -54,7 +67,7 @@ impl Sampler {
         system.refresh_processes(ProcessesToUpdate::All, true);
         let (vram_tx, vram_rx) = mpsc::channel();
         spawn_nvidia_smi(vram_tx.clone());
-        let last = snapshot(&system, None);
+        let last = snapshot(&system, None, &[]);
         Self {
             system,
             last,
@@ -67,8 +80,9 @@ impl Sampler {
     }
 
     /// Advance the sampler: when the 1s gate elapses, refresh and take a new
-    /// snapshot. Always returns the most recent snapshot.
-    pub fn tick(&mut self) -> &Resources {
+    /// snapshot. Always returns the most recent snapshot. `pane_pids` are the
+    /// panes' child PIDs, in pane order; each is resolved to a [`PaneRes`].
+    pub fn tick(&mut self, pane_pids: &[u32]) -> &Resources {
         if self.last_tick.elapsed() < Duration::from_secs(1) {
             return &self.last;
         }
@@ -91,13 +105,15 @@ impl Sampler {
             spawn_nvidia_smi(self.vram_tx.clone());
         }
 
-        self.last = snapshot(&self.system, self.last_vram);
+        self.last = snapshot(&self.system, self.last_vram, pane_pids);
         &self.last
     }
 }
 
 /// Take a [`Resources`] snapshot from `system`, with the resolved VRAM value.
-fn snapshot(system: &System, vram: Option<(u64, u64)>) -> Resources {
+/// `pane_pids` (in pane order) are resolved to per-pane [`PaneRes`] entries;
+/// an unknown or already-exited PID reads as zeros.
+fn snapshot(system: &System, vram: Option<(u64, u64)>, pane_pids: &[u32]) -> Resources {
     let pid = Pid::from(std::process::id() as usize);
     let proc = system.process(pid);
     let (sys_vram_used, sys_vram_total) = match vram {
@@ -112,6 +128,16 @@ fn snapshot(system: &System, vram: Option<(u64, u64)>) -> Resources {
         sys_vram_total,
         app_cpu: proc.map(|p| p.cpu_usage()).unwrap_or(0.0),
         app_ram: proc.map(|p| p.memory()).unwrap_or(0),
+        panes: pane_pids
+            .iter()
+            .map(|&pid| {
+                let p = system.process(Pid::from(pid as usize));
+                PaneRes {
+                    cpu: p.map(|p| p.cpu_usage()).unwrap_or(0.0),
+                    mem: p.map(|p| p.memory()).unwrap_or(0),
+                }
+            })
+            .collect(),
     }
 }
 
@@ -196,5 +222,23 @@ mod tests {
     fn parse_nvidia_smi_garbage_is_none() {
         assert!(parse_nvidia_smi("NVIDIA-SMI has failed").is_none());
         assert!(parse_nvidia_smi("abc,def\n").is_none());
+    }
+
+    /// `tick` resolves each pane PID through `system.process` and fills
+    /// `Resources.panes` in order. Uses the test process's own PID, which
+    /// `refresh_processes(All)` is guaranteed to know about.
+    #[test]
+    fn tick_populates_panes_for_known_pid() {
+        let mut sampler = Sampler::new();
+        let own_pid = std::process::id();
+        // The 1s gate: the first tick returns the primed snapshot (empty
+        // `panes`), so wait for the gate to elapse before the first refresh.
+        std::thread::sleep(Duration::from_millis(1100));
+        let res = sampler.tick(&[own_pid]);
+        assert_eq!(res.panes.len(), 1);
+        assert!(
+            res.panes[0].mem > 0,
+            "our own process should report non-zero memory"
+        );
     }
 }

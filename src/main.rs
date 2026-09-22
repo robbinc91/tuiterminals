@@ -6,17 +6,20 @@ mod config;
 mod input;
 mod render;
 mod resources;
+mod session;
 mod ui;
 
 use std::io::stdout;
 use std::time::Duration;
 
+use alacritty_terminal::grid::Scroll;
 use app::{App, Launch, PaneStatus, TermSize};
-use config::Config;
-use ui::{Modal, ModalAction, NewAgentStep};
+use session::{session_path, Session};
+use config::{Config, ToolKind};
+use ui::{Modal, ModalAction, NewAgentStep, ToolStep};
 use resources::Sampler;
 use crossterm::event;
-use crossterm::event::{Event, KeyEventKind};
+use crossterm::event::{Event, KeyEventKind, MouseEventKind};
 use crossterm::terminal;
 use crossterm::terminal::SetTitle;
 use crossterm::{cursor, ExecutableCommand};
@@ -57,6 +60,9 @@ fn main() -> anyhow::Result<()> {
     let mut term = CrosstermBackend::new(stdout());
     term.execute(terminal::EnterAlternateScreen)?;
     term.execute(cursor::Hide)?;
+    // Wheel events drive pane scrolling; the capture must be released again on
+    // every exit path (see the disable calls below).
+    term.execute(event::EnableMouseCapture)?;
 
     let mut terminal = Terminal::new(term)?;
 
@@ -67,6 +73,7 @@ fn main() -> anyhow::Result<()> {
         let _ = out.execute(terminal::LeaveAlternateScreen);
         let _ = out.execute(cursor::Show);
         let _ = out.execute(SetTitle(""));
+        let _ = out.execute(event::DisableMouseCapture);
         let _ = terminal::disable_raw_mode();
         default_hook(info);
     }));
@@ -77,6 +84,7 @@ fn main() -> anyhow::Result<()> {
     let _ = out.execute(terminal::LeaveAlternateScreen);
     let _ = terminal.show_cursor();
     let _ = out.execute(SetTitle(""));
+    let _ = out.execute(event::DisableMouseCapture);
     let _ = terminal::disable_raw_mode();
 
     result
@@ -91,7 +99,22 @@ fn run(terminal: &mut AppTerminal, config: &Config) -> anyhow::Result<()> {
         render::inner_area(outer).height,
         render::inner_area(outer).width,
     );
-    let mut app = App::new(pty_system, first_size, config)?;
+    // Restore the last session if one is on disk and non-empty; otherwise
+    // start fresh. A missing or malformed file (or a disabled restore) falls
+    // through to the single-shell-pane default without erroring.
+    let session = if config.restore_sessions {
+        Session::load(&session_path()).ok()
+    } else {
+        None
+    };
+    let mut app = match session.as_ref().filter(|s| !s.panes.is_empty()) {
+        Some(s) => App::from_session(pty_system, first_size, config, s)?,
+        None => App::new(pty_system, first_size, config)?,
+    };
+    // A restore can bring back several panes, all created at the full area
+    // size; reflow so each shrinks to its layout slot. A no-op for the single
+    // fresh pane, which already fills the area.
+    reflow(terminal, &mut app)?;
 
     let mut sampler = Sampler::new();
     // The OS window/tab title doubles as an out-of-window nag: how many panes
@@ -114,7 +137,7 @@ fn run(terminal: &mut AppTerminal, config: &Config) -> anyhow::Result<()> {
                         // A modal is open: every key routes to it. A key that
                         // doesn't complete the flow is swallowed.
                         let targets = ui::send_targets(&app, app.active);
-                        if let Some(action) = modal.handle_key(&key, &config.agents, &targets) {
+                        if let Some(action) = modal.handle_key(&key, &config.agents, &config.tools, &targets) {
                             match action {
                                 ModalAction::SpawnShell { shared } => {
                                     if let Some(index) = spawn_pane(
@@ -142,6 +165,30 @@ fn run(terminal: &mut AppTerminal, config: &Config) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
+                                ModalAction::RunTool { index, shared } => match config
+                                    .tools
+                                    .get(index)
+                                    .map(|t| t.kind)
+                                {
+                                    // A `prompt` tool types into the active pane —
+                                    // no new pane is spawned.
+                                    Some(ToolKind::Prompt) => app.run_tool(index),
+                                    // A `run` tool (or a stale index) spawns a new
+                                    // pane, like an agent.
+                                    _ => {
+                                        if let Some(new) = spawn_pane(
+                                            terminal,
+                                            &mut app,
+                                            config.max_panes,
+                                            &Launch::Tool(index),
+                                            shared,
+                                        )? {
+                                            if shared {
+                                                app.note_shared_context(new);
+                                            }
+                                        }
+                                    }
+                                },
                                 ModalAction::Send { target } => app.send_to(target),
                                 ModalAction::Cancel => {}
                             }
@@ -162,6 +209,16 @@ fn run(terminal: &mut AppTerminal, config: &Config) -> anyhow::Result<()> {
                                 if app.panes.len() < config.max_panes {
                                     modal = Modal::NewAgent {
                                         step: NewAgentStep::Pick,
+                                        chosen: None,
+                                    };
+                                }
+                            }
+                            Some(input::GlobalKey::RunTool) => {
+                                // The picker is only useful with at least one
+                                // configured tool; with none, the binding is a no-op.
+                                if !config.tools.is_empty() {
+                                    modal = Modal::ToolPicker {
+                                        step: ToolStep::Pick,
                                         chosen: None,
                                     };
                                 }
@@ -194,6 +251,18 @@ fn run(terminal: &mut AppTerminal, config: &Config) -> anyhow::Result<()> {
                                     app.dump_context();
                                 }
                             }
+                            Some(input::GlobalKey::ScrollUp) => {
+                                scroll_active(&mut app, Scroll::Delta(3))
+                            }
+                            Some(input::GlobalKey::ScrollDown) => {
+                                scroll_active(&mut app, Scroll::Delta(-3))
+                            }
+                            Some(input::GlobalKey::ScrollTop) => {
+                                scroll_active(&mut app, Scroll::Top)
+                            }
+                            Some(input::GlobalKey::ScrollBottom) => {
+                                scroll_active(&mut app, Scroll::Bottom)
+                            }
                             None => {
                                 if let Some(pane) = app.panes.get_mut(app.active) {
                                     if pane.alive {
@@ -210,6 +279,21 @@ fn run(terminal: &mut AppTerminal, config: &Config) -> anyhow::Result<()> {
                         }
                     }
                 }
+                // The wheel scrolls the active pane, mirroring how keys route.
+                // A modal open swallows the event (consistent with keys).
+                Event::Mouse(mouse) => {
+                    if modal == Modal::None {
+                        // Wheel notches scroll the active pane, 3 lines each.
+                        let delta = match mouse.kind {
+                            MouseEventKind::ScrollUp => 3,
+                            MouseEventKind::ScrollDown => -3,
+                            _ => 0,
+                        };
+                        if delta != 0 {
+                            scroll_active(&mut app, Scroll::Delta(delta));
+                        }
+                    }
+                }
                 Event::Resize(_, _) => reflow(terminal, &mut app)?,
                 _ => {}
             }
@@ -219,7 +303,7 @@ fn run(terminal: &mut AppTerminal, config: &Config) -> anyhow::Result<()> {
             break;
         }
 
-        let res = sampler.tick();
+        let res = sampler.tick(&app.pane_pids());
 
         // Update the window title to nag about idle panes, only on change.
         // Best-effort: a terminal that ignores OSC 0 must not kill the loop.
@@ -239,6 +323,12 @@ fn run(terminal: &mut AppTerminal, config: &Config) -> anyhow::Result<()> {
         }
 
         terminal.draw(|frame| render::draw_panes(frame, &app, &config.colors, res, &modal))?;
+    }
+
+    // Best-effort: remember the current layout for the next run. A save
+    // failure is ignored — it must never error the exit.
+    if config.restore_sessions {
+        let _ = Session::save(&session_path(), &app, config);
     }
 
     Ok(())
@@ -267,6 +357,14 @@ fn spawn_pane(
     app.active = index;
     reflow(terminal, app)?;
     Ok(Some(index))
+}
+
+/// Scroll the active pane's grid by `scroll`. No `alive` gate: a dead pane's
+/// grid is still scrollable, which is how you read a shell's last output.
+fn scroll_active(app: &mut App, scroll: Scroll) {
+    if let Some(pane) = app.panes.get_mut(app.active) {
+        pane.term.scroll_display(scroll);
+    }
 }
 
 /// Recompute the pane layout for the current terminal size and resize every

@@ -1,4 +1,5 @@
-//! TOML configuration: shell, keybindings, colors, and the max-panes cap.
+//! TOML configuration: shell, agents, tools, keybindings, colors, and the
+//! max-panes cap.
 //!
 //! The file is loaded from `--config <path>`, or from the platform config
 //! directory (`~/.config/tuiterminals/config.toml`) when no flag is given.
@@ -18,6 +19,17 @@
 //! program = "claude"
 //! args = []
 //!
+//! [[tools]]
+//! name = "review"
+//! kind = "run"              # spawn a program in a new pane
+//! program = "claude"
+//! args = ["-p", "Review the git diff in {cwd}"]
+//!
+//! [[tools]]
+//! name = "explain"
+//! kind = "prompt"           # type a template into the active pane
+//! text = "Explain the code on screen. Cwd: {cwd}"
+//!
 //! [keybindings]
 //! new_pane  = "ctrl+n"
 //! kill_pane = "ctrl+k"
@@ -28,6 +40,11 @@
 //! send_context      = "ctrl+shift+s"
 //! broadcast_context = "ctrl+shift+b"
 //! dump_context      = "ctrl+shift+c"
+//! run_tool          = "ctrl+shift+t"
+//! scroll_up         = "ctrl+shift+up"
+//! scroll_down       = "ctrl+shift+down"
+//! scroll_top        = "ctrl+shift+home"
+//! scroll_bottom     = "ctrl+shift+end"
 //!
 //! [colors]
 //! active_border   = "#00ffff"
@@ -51,6 +68,11 @@ pub struct Config {
     /// Named agent programs the agent picker offers (see `[[agents]]`).
     #[serde(default)]
     pub agents: Vec<Agent>,
+    /// Named one-shot tools the `run_tool` picker offers (see `[[tools]]`).
+    /// Unlike the other sections, a present-but-incomplete `[[tools]]` entry
+    /// is a hard error (see [`Tool`]).
+    #[serde(default, deserialize_with = "deserialize_tools")]
+    pub tools: Vec<Tool>,
     /// Global (app-level) keybindings.
     #[serde(default)]
     pub keybindings: Keybindings,
@@ -60,6 +82,15 @@ pub struct Config {
     /// Maximum number of panes in the grid.
     #[serde(default = "default_max_panes")]
     pub max_panes: usize,
+    /// Lines of scrollback history each pane's grid keeps above the visible
+    /// screen.
+    #[serde(default = "default_scrollback_lines")]
+    pub scrollback_lines: usize,
+    /// Whether to restore the previous session's panes on startup (and save
+    /// them on exit). A `false` here means the app always opens with a single
+    /// fresh shell pane and writes no session file.
+    #[serde(default = "default_restore_sessions")]
+    pub restore_sessions: bool,
 }
 
 impl Default for Config {
@@ -67,9 +98,12 @@ impl Default for Config {
         Self {
             shell: None,
             agents: vec![],
+            tools: vec![],
             keybindings: Keybindings::default(),
             colors: Colors::default(),
             max_panes: default_max_panes(),
+            scrollback_lines: default_scrollback_lines(),
+            restore_sessions: default_restore_sessions(),
         }
     }
 }
@@ -93,6 +127,14 @@ fn default_max_panes() -> usize {
     4
 }
 
+fn default_scrollback_lines() -> usize {
+    10000
+}
+
+fn default_restore_sessions() -> bool {
+    true
+}
+
 /// The program each pane runs, plus its arguments.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
@@ -112,7 +154,117 @@ pub struct Agent {
     pub args: Vec<String>,
 }
 
-/// The five global actions and their key combos.
+/// What a tool does when fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
+    /// Spawn `program`/`args` in a new pane (like an agent, but one-shot).
+    Run,
+    /// Type the expanded `text` template into the active pane.
+    Prompt,
+}
+
+/// A named one-shot command or prompt template (`[[tools]]`).
+///
+/// Two kinds: a **run** tool spawns `program`/`args` in a new pane (the pane
+/// then goes through the usual share/isolate question), and a **prompt** tool
+/// types its `text` — with `{cwd}` and `{screen}` placeholders expanded — into
+/// the active pane. Unlike the other config sections, a present-but-incomplete
+/// entry is a **hard error**: a `run` tool needs `program` (and `kind = "run"`),
+/// a `prompt` tool needs `text` (and `kind = "prompt"`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tool {
+    pub name: String,
+    pub kind: ToolKind,
+    /// Program to spawn, for `run` tools.
+    pub program: Option<String>,
+    /// Arguments for the spawned program, for `run` tools.
+    pub args: Vec<String>,
+    /// The prompt template, for `prompt` tools.
+    pub text: Option<String>,
+}
+
+/// The raw, unvalidated shape of a `[[tools]]` entry. Deserialized per entry
+/// so a malformed one produces a precise error (see [`tool_from_raw`]).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct RawTool {
+    name: String,
+    kind: Option<String>,
+    program: Option<String>,
+    args: Vec<String>,
+    text: Option<String>,
+}
+
+/// Validate a raw tool entry: `kind` must be `"run"` or `"prompt"`; a `run`
+/// tool must carry a non-empty `program`; a `prompt` tool must carry a
+/// non-empty `text`.
+fn tool_from_raw(raw: RawTool) -> Result<Tool, String> {
+    let kind = match raw.kind.as_deref() {
+        Some("run") => ToolKind::Run,
+        Some("prompt") => ToolKind::Prompt,
+        Some(other) => {
+            return Err(format!(
+                "tool {}: unknown kind {other:?} (expected \"run\" or \"prompt\")",
+                raw.name
+            ))
+        }
+        None => {
+            return Err(format!(
+                "tool {}: missing kind (expected \"run\" or \"prompt\")",
+                raw.name
+            ))
+        }
+    };
+    match kind {
+        ToolKind::Run => {
+            let program = match raw.program.filter(|p| !p.trim().is_empty()) {
+                Some(p) => p,
+                None => {
+                    return Err(format!(
+                        "tool {}: a run tool needs a non-empty program",
+                        raw.name
+                    ))
+                }
+            };
+            Ok(Tool {
+                name: raw.name,
+                kind,
+                program: Some(program),
+                args: raw.args,
+                text: None,
+            })
+        }
+        ToolKind::Prompt => {
+            let text = match raw.text.filter(|t| !t.trim().is_empty()) {
+                Some(t) => t,
+                None => {
+                    return Err(format!(
+                        "tool {}: a prompt tool needs a non-empty text",
+                        raw.name
+                    ))
+                }
+            };
+            Ok(Tool {
+                name: raw.name,
+                kind,
+                program: None,
+                args: vec![],
+                text: Some(text),
+            })
+        }
+    }
+}
+
+/// Deserialize the `[[tools]]` list, validating each entry.
+fn deserialize_tools<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Tool>, D::Error> {
+    let raws: Vec<RawTool> = serde::Deserialize::deserialize(d)?;
+    raws.into_iter()
+        .map(tool_from_raw)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(serde::de::Error::custom)
+}
+
+/// The global actions and their key combos.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Keybindings {
     #[serde(
@@ -160,6 +312,31 @@ pub struct Keybindings {
         deserialize_with = "deserialize_key_combo"
     )]
     pub dump_context: KeyCombo,
+    #[serde(
+        default = "KeyCombo::run_tool_default",
+        deserialize_with = "deserialize_key_combo"
+    )]
+    pub run_tool: KeyCombo,
+    #[serde(
+        default = "KeyCombo::scroll_up_default",
+        deserialize_with = "deserialize_key_combo"
+    )]
+    pub scroll_up: KeyCombo,
+    #[serde(
+        default = "KeyCombo::scroll_down_default",
+        deserialize_with = "deserialize_key_combo"
+    )]
+    pub scroll_down: KeyCombo,
+    #[serde(
+        default = "KeyCombo::scroll_top_default",
+        deserialize_with = "deserialize_key_combo"
+    )]
+    pub scroll_top: KeyCombo,
+    #[serde(
+        default = "KeyCombo::scroll_bottom_default",
+        deserialize_with = "deserialize_key_combo"
+    )]
+    pub scroll_bottom: KeyCombo,
 }
 
 impl Default for Keybindings {
@@ -174,6 +351,11 @@ impl Default for Keybindings {
             send_context: KeyCombo::send_context_default(),
             broadcast_context: KeyCombo::broadcast_context_default(),
             dump_context: KeyCombo::dump_context_default(),
+            run_tool: KeyCombo::run_tool_default(),
+            scroll_up: KeyCombo::scroll_up_default(),
+            scroll_down: KeyCombo::scroll_down_default(),
+            scroll_top: KeyCombo::scroll_top_default(),
+            scroll_bottom: KeyCombo::scroll_bottom_default(),
         }
     }
 }
@@ -238,6 +420,36 @@ impl KeyCombo {
         Self {
             mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             code: KeyCode::Char('c'),
+        }
+    }
+    fn run_tool_default() -> Self {
+        Self {
+            mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            code: KeyCode::Char('t'),
+        }
+    }
+    fn scroll_up_default() -> Self {
+        Self {
+            mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            code: KeyCode::Up,
+        }
+    }
+    fn scroll_down_default() -> Self {
+        Self {
+            mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            code: KeyCode::Down,
+        }
+    }
+    fn scroll_top_default() -> Self {
+        Self {
+            mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            code: KeyCode::Home,
+        }
+    }
+    fn scroll_bottom_default() -> Self {
+        Self {
+            mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            code: KeyCode::End,
         }
     }
 
@@ -528,7 +740,13 @@ mod tests {
         assert_eq!(kb.send_context, parse_combo("ctrl+shift+s").unwrap());
         assert_eq!(kb.broadcast_context, parse_combo("ctrl+shift+b").unwrap());
         assert_eq!(kb.dump_context, parse_combo("ctrl+shift+c").unwrap());
+        assert_eq!(kb.run_tool, parse_combo("ctrl+shift+t").unwrap());
+        assert_eq!(kb.scroll_up, parse_combo("ctrl+shift+up").unwrap());
+        assert_eq!(kb.scroll_down, parse_combo("ctrl+shift+down").unwrap());
+        assert_eq!(kb.scroll_top, parse_combo("ctrl+shift+home").unwrap());
+        assert_eq!(kb.scroll_bottom, parse_combo("ctrl+shift+end").unwrap());
         assert_eq!(Config::default().max_panes, 4);
+        assert_eq!(Config::default().scrollback_lines, 10000);
     }
 
     #[test]
@@ -549,7 +767,23 @@ mod tests {
         assert_eq!(config.max_panes, 8);
         assert!(config.shell.is_none());
         assert!(config.agents.is_empty());
+        assert!(config.tools.is_empty());
         assert_eq!(config.keybindings, Keybindings::default());
+        // An absent scrollback knob falls back to the default.
+        assert_eq!(config.scrollback_lines, 10000);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_partial_file_parses_scrollback_lines() {
+        let dir = std::env::temp_dir().join("tuiterminals-test-scrollback");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scrollback.toml");
+        std::fs::write(&path, "scrollback_lines = 500\n").unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.scrollback_lines, 500);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -578,6 +812,17 @@ name = "codex"
 program = "codex"
 args = ["--yolo"]
 
+[[tools]]
+name = "review"
+kind = "run"
+program = "claude"
+args = ["-p", "Review the git diff in {cwd}"]
+
+[[tools]]
+name = "explain"
+kind = "prompt"
+text = "Explain the code on screen. Cwd: {cwd}"
+
 [keybindings]
 new_pane  = "ctrl+n"
 kill_pane = "ctrl+k"
@@ -588,6 +833,11 @@ new_agent         = "ctrl+shift+n"
 send_context      = "ctrl+shift+s"
 broadcast_context = "ctrl+shift+b"
 dump_context      = "ctrl+shift+c"
+run_tool          = "ctrl+shift+t"
+scroll_up         = "ctrl+shift+up"
+scroll_down       = "ctrl+shift+down"
+scroll_top        = "ctrl+shift+home"
+scroll_bottom     = "ctrl+shift+end"
 
 [colors]
 active_border   = "#00ffff"
@@ -621,6 +871,25 @@ inactive_border = "#444444"
         );
         assert_eq!(config.max_panes, 6);
         assert_eq!(
+            config.tools,
+            vec![
+                Tool {
+                    name: "review".to_string(),
+                    kind: ToolKind::Run,
+                    program: Some("claude".to_string()),
+                    args: vec!["-p".to_string(), "Review the git diff in {cwd}".to_string()],
+                    text: None,
+                },
+                Tool {
+                    name: "explain".to_string(),
+                    kind: ToolKind::Prompt,
+                    program: None,
+                    args: vec![],
+                    text: Some("Explain the code on screen. Cwd: {cwd}".to_string()),
+                }
+            ]
+        );
+        assert_eq!(
             config.colors.active_border,
             RgbColor {
                 r: 0x00,
@@ -639,6 +908,83 @@ inactive_border = "#444444"
         // The example uses the documented defaults, so it should equal them.
         assert_eq!(config.keybindings, Keybindings::default());
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_prompt_tool_missing_text_errors() {
+        let dir = std::env::temp_dir().join("tuiterminals-test-tool-text");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tool.toml");
+        std::fs::write(
+            &path,
+            r##"
+[[tools]]
+name = "explain"
+kind = "prompt"
+"##,
+        )
+        .unwrap();
+
+        assert!(Config::load(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_run_tool_missing_program_errors() {
+        let dir = std::env::temp_dir().join("tuiterminals-test-tool-program");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tool.toml");
+        std::fs::write(
+            &path,
+            r##"
+[[tools]]
+name = "review"
+kind = "run"
+"##,
+        )
+        .unwrap();
+
+        assert!(Config::load(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_tool_missing_kind_errors() {
+        let dir = std::env::temp_dir().join("tuiterminals-test-tool-kind");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tool.toml");
+        std::fs::write(
+            &path,
+            r##"
+[[tools]]
+name = "mystery"
+program = "claude"
+"##,
+        )
+        .unwrap();
+
+        assert!(Config::load(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_tool_unknown_kind_errors() {
+        let dir = std::env::temp_dir().join("tuiterminals-test-tool-unknown-kind");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tool.toml");
+        std::fs::write(
+            &path,
+            r##"
+[[tools]]
+name = "weird"
+kind = "teleport"
+program = "claude"
+"##,
+        )
+        .unwrap();
+
+        assert!(Config::load(&path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
