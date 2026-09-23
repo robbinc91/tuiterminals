@@ -32,16 +32,27 @@ green, `● idle` in yellow, `✕ dead` in gray — plus the agent's name and a
   grid. Each pane is a real pseudo-terminal running its own process.
 - **Shells or agents.** Every pane runs your configured shell — or a named agent
   (e.g. `claude`, `codex`) launched from the agent picker.
+- **One-shot tools.** Named `[[tools]]` are fired from the tool picker: a `run` tool
+  spawns its program in a new pane (then the usual share/isolate question), and a
+  `prompt` tool types a template — with `{cwd}` and `{screen}` placeholders expanded —
+  into the active pane.
 - **A context bus.** Panes can *share* or stay *isolated*. A shared pane's visible
   screen can be sent to another pane, broadcast to all of them, or dumped to a
   `CONTEXT.md` file — wrapped in bracketed-paste markers so agent TUIs treat it as
   one paste.
 - **cwd tracking.** `cd`/`pushd` you type in a pane is tracked, so a pane you open
   right after a `cd` lands in the same directory.
+- **Scrollback history.** Each pane keeps a scrollback of prior output (default 10000
+  rows); scroll up into it with the mouse wheel or the `scroll_*` bindings, and the
+  live screen is restored when you scroll back down.
+- **Session restore.** On exit the app saves each pane's directory and launch, and on
+  the next start offers to bring them back — each respawned fresh in the directory it
+  was last in.
 - **A resource bar.** A two-row monitor at the top shows whole-machine (`SYS`) and
   this-process (`APP`) CPU / RAM / VRAM.
-- **Configurable.** A TOML file makes the shell, agents, keybindings, border colors,
-  and pane cap all yours. No file → sensible defaults.
+- **Configurable.** A TOML file makes the shell, agents, tools, keybindings, border
+  colors, pane cap, scrollback depth, and session restore all yours. No file →
+  sensible defaults.
 
 ## Requirements
 
@@ -87,23 +98,34 @@ errors out cleanly rather than corrupting your outer terminal). It is read from
 file fills the absent fields with the same defaults — so no config file means the app
 behaves exactly as it would with one. A present-but-malformed file is a hard error.
 
-The five knobs:
+The eight knobs:
 
 - **`[shell]`** — `program` + `args`; each new shell pane spawns this. Absent → the
   platform default shell.
 - **`[[agents]]`** — a list of named agent programs (`name`, `program`, `args`), written
   as repeated tables. Each is launchable into a pane from the agent picker. Absent →
   the picker offers a plain shell only.
-- **`[keybindings]`** — the nine global actions, each a key-combo string.
+- **`[[tools]]`** — a list of named one-shot tools (`name`, `kind`, and either
+  `program`/`args` for a `run` tool or `text` for a `prompt` tool), written as repeated
+  tables. A `run` tool spawns its program in a new pane (then the usual share/isolate
+  question); a `prompt` tool types its `text` — with `{cwd}` and `{screen}` placeholders
+  expanded — into the active pane. Unlike the other sections, a present-but-incomplete
+  entry is a hard error. Absent → no tool picker.
+- **`[keybindings]`** — the fourteen global actions, each a key-combo string.
 - **`[colors]`** — `active_border` / `inactive_border`, each a `"#rrggbb"` string. These
   retheme the pane chrome only; a program's own cell colors still come from the
   alacritty palette.
 - **`max_panes`** — the pane cap (default `4`).
+- **`scrollback_lines`** — per-pane scrollback history in rows (default `10000`).
+- **`restore_sessions`** — whether the app saves its panes on exit and offers to restore
+  them on the next start (default `true`). See [Session persistence](#session-persistence).
 
 ### Example
 
 ```toml
 max_panes = 6
+scrollback_lines = 10000
+restore_sessions = true
 
 [shell]
 program = "powershell"
@@ -119,6 +141,17 @@ name = "codex"
 program = "codex"
 args = []
 
+[[tools]]
+name = "review"
+kind = "run"
+program = "claude"
+args = ["-p", "Review the git diff in {cwd}"]
+
+[[tools]]
+name = "explain"
+kind = "prompt"
+text = "Explain the code on screen. Cwd: {cwd}"
+
 [keybindings]
 new_pane          = "ctrl+n"
 kill_pane         = "ctrl+k"
@@ -126,9 +159,14 @@ quit              = "ctrl+q"
 prev_pane         = "ctrl+left"
 next_pane         = "ctrl+right"
 new_agent         = "ctrl+shift+n"
+run_tool          = "ctrl+shift+t"
 send_context      = "ctrl+shift+s"
 broadcast_context = "ctrl+shift+b"
 dump_context      = "ctrl+shift+c"
+scroll_up         = "ctrl+shift+up"
+scroll_down       = "ctrl+shift+down"
+scroll_top        = "ctrl+shift+home"
+scroll_bottom     = "ctrl+shift+end"
 
 [colors]
 active_border   = "#00ffff"
@@ -148,9 +186,14 @@ alt, super) match exactly — so `ctrl+n` does not also fire on `shift+ctrl+n`.
 | `prev_pane`         | `ctrl+left`      | Focus the previous pane                                    |
 | `next_pane`         | `ctrl+right`     | Focus the next pane                                        |
 | `new_agent`         | `ctrl+shift+n`   | Open the agent picker (then the share/isolate question)   |
+| `run_tool`          | `ctrl+shift+t`   | Open the tool picker (a `run` tool spawns a pane; a `prompt` tool types into the active pane) |
 | `send_context`      | `ctrl+shift+s`   | Send the active pane's screen to a chosen shared pane     |
 | `broadcast_context` | `ctrl+shift+b`   | Send the active pane's screen to every other shared pane  |
 | `dump_context`      | `ctrl+shift+c`   | Append the active pane's screen to `CONTEXT.md`          |
+| `scroll_up`         | `ctrl+shift+up`  | Scroll the active pane up 3 lines (the mouse wheel does the same) |
+| `scroll_down`       | `ctrl+shift+down`| Scroll the active pane down 3 lines                      |
+| `scroll_top`        | `ctrl+shift+home`| Scroll the active pane to the top of its history           |
+| `scroll_bottom`     | `ctrl+shift+end` | Scroll the active pane back to the live screen            |
 
 Key-combo strings are `+`-separated: a modifier list (`ctrl`/`control`, `alt`/`option`,
 `shift`, `super`/`meta`/`cmd`/`win`) plus exactly one key. Named keys include `left`,
@@ -203,9 +246,33 @@ at the target's prompt and you decide whether to send it. When a *shared* pane i
 spawned, a pointer line (`shared context: <launch_dir>/CONTEXT.md`) is typed into it so
 the agent knows where the shared file lives.
 
+## Session persistence
+
+tmux-style: on exit the app saves its pane layout, and on the next start it offers
+to bring it back. **Nothing about the live terminal contents is captured** — every
+pane is respawned *fresh* in the directory it was last in. The file is a small TOML
+document at the platform config dir (`~/.config/tuiterminals/session.toml` on Unix,
+`%APPDATA%\tuiterminals\session.toml` on Windows), written by `src/session.rs`.
+
+- **What's saved** — one entry per pane, in pane order: its tracked `cwd`, its launch
+  (a plain `shell`, or a named agent/tool), and whether it was on the context bus.
+  Agents and tools are stored **by name** (`agent:<name>`, `tool:<name>`) rather than
+  by index, so reordering the `[[agents]]`/`[[tools]]` lists in the config never
+  mis-resolves a saved pane. Pane 0 is always written `shared = true` — the bus-root
+  invariant — regardless of its own flag.
+- **Restoring** — `App::from_session` (in `src/app.rs`) rebuilds one fresh pane per
+  saved pane (capped at `max_panes`), each re-launched in its last directory. A saved
+  agent or tool that no longer exists in the config falls back to a plain shell, so a
+  stale session never fails a spawn; the first pane is always shared. `main.rs` reflows
+  afterwards so each pane shrinks from the full area to its layout slot.
+- **Gating** — the `restore_sessions` config knob (default `true`) controls both ends:
+  when off, the app neither reads a session on start nor writes one on exit. A missing
+  or malformed session file is swallowed (falls through to the single-shell-pane
+  default) rather than erroring.
+
 ## How it works
 
-Six modules, one per concern. The data flow that ties them together:
+Eight modules, one per concern. The data flow that ties them together:
 
 ```
 portable-pty ──▶ byte stream (mpsc channel from a per-pane reader thread)
@@ -224,6 +291,7 @@ portable-pty ──▶ byte stream (mpsc channel from a per-pane reader thread)
 | `src/render.rs`  | Pane layout (1 fills, 2 splits, 3–4 form a 2×2 grid), drawing borders + each pane's grid, the top resource bar, the bottom modal prompt, and the alacritty→ratatui color/flag translation. |
 | `src/resources.rs` | The top resource bar's sampler: `sysinfo` for CPU/RAM and an off-main-thread `nvidia-smi` probe for VRAM. |
 | `src/config.rs`  | The TOML config subsystem: loading, key-combo parsing, and color parsing. |
+| `src/session.rs` | tmux-style session persistence: save each pane's `cwd` + launch on exit, and rebuild them fresh on the next start (see [Session persistence](#session-persistence)). |
 
 ### The Windows ConPTY quirk
 
@@ -237,7 +305,7 @@ the `pump_unblocks_conpty_roundtrip` test exists specifically to catch a regress
 
 ## Testing
 
-The suite runs with `cargo test` and lives in four modules:
+The suite runs with `cargo test` and lives in five modules:
 
 - **`src/config.rs`** — key-combo parsing, color parsing, and `Config::load` against temp
   files (fast, no I/O beyond temp files).
@@ -246,6 +314,8 @@ The suite runs with `cargo test` and lives in four modules:
   `pump_unblocks_conpty_roundtrip` — a **real integration test** that spawns a live shell
   in a PTY and pumps it for up to 5s until output reaches the grid. It is the regression
   guard for the ConPTY stall and the slow test in the suite.
+- **`src/input.rs`** — the scroll-binding routing: the four scroll defaults resolve to the
+  scroll actions, and a bare arrow key (no modifiers) does not.
 - **`src/ui.rs`** — every modal transition (share/isolate, agent picker, send-target) and
   the prompt-line strings.
 - **`src/resources.rs`** — the `nvidia-smi` VRAM output parser.
